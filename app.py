@@ -4,10 +4,10 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sentence_transformers import SentenceTransformer
 from chromadb import PersistentClient
-import pymupdf  # Correct import for PyMuPDF
+import pymupdf
 from docx import Document
 from datetime import datetime
-import sqlite3 # Still needed, but not used in the new visualize route
+import sqlite3 
 
 # ---------------- CONFIG ----------------
 CHROMA_DIR = "./chroma_db"
@@ -159,55 +159,66 @@ def export_collection(col_name):
     )
 
 
-# ---------- UPLOAD ----------
+# ---------- UPLOAD (FIXED WITH TRY/EXCEPT) ----------
 @app.route("/upload", methods=["GET", "POST"])
 def upload():
     """Handles uploading text or files, and embedding."""
     cols = [c.name for c in client.list_collections()]
 
     if request.method == "POST":
-        col_name = request.form["collection"]
-        input_type = request.form["input_type"]
-        
-        if col_name not in [c.name for c in client.list_collections()]:
-             return "Error: Collection does not exist.", 400
-
-        col = client.get_collection(col_name)
-
-        metadata_raw = request.form.get("metadata", "")
+        # Start comprehensive try/except block to ensure a return statement is always hit
         try:
-            metadata = json.loads(metadata_raw) if metadata_raw else {}
-        except:
-            metadata = {}
+            col_name = request.form["collection"]
+            input_type = request.form["input_type"]
+            
+            if col_name not in [c.name for c in client.list_collections()]:
+                 return "Error: Collection does not exist.", 400
 
-        text = ""
-        if input_type == "text":
-            text = request.form.get("text", "").strip()
+            col = client.get_collection(col_name)
 
-        elif input_type == "file":
-            uploaded = request.files.get("file")
-            if uploaded and uploaded.filename:
-                save_path = os.path.join(UPLOAD_DIR, uploaded.filename)
-                uploaded.save(save_path)
-                text = extract_text_from_file(save_path)
-                os.remove(save_path) # Clean up
+            metadata_raw = request.form.get("metadata", "")
+            try:
+                metadata = json.loads(metadata_raw) if metadata_raw else {}
+            except:
+                metadata = {}
 
-        if not text:
-            return "No text provided or extracted.", 400
+            text = ""
+            if input_type == "text":
+                text = request.form.get("text", "").strip()
 
-        emb = model.encode([text])[0].tolist()
-        
-        col.add(
-            ids=[str(uuid.uuid4())],
-            documents=[text],
-            metadatas=[{**metadata, "timestamp": str(datetime.now())}],
-            embeddings=[emb],
-        )
-        
-        return redirect(url_for("search"))
+            elif input_type == "file":
+                uploaded = request.files.get("file")
+                if uploaded and uploaded.filename:
+                    save_path = os.path.join(UPLOAD_DIR, uploaded.filename)
+                    uploaded.save(save_path)
+                    text = extract_text_from_file(save_path)
+                    os.remove(save_path) # Clean up
+
+            if not text:
+                return "No text provided or extracted.", 400
+
+            # Embed and upload
+            emb = model.encode([text])[0].tolist()
+            
+            col.add(
+                ids=[str(uuid.uuid4())],
+                documents=[text],
+                metadatas=[{**metadata, "timestamp": str(datetime.now())}],
+                embeddings=[emb],
+            )
+            
+            return redirect(url_for("search"))
+
+        except Exception as e:
+            # Catch-all: If any error occurred during the POST process, return a 500 error
+            print(f"UPLOAD PROCESSING ERROR: {e}")
+            return f"An unhandled error occurred during processing: {e}", 500
 
 
-# ---------- SEARCH ----------
+    return render_template("upload.html", collections=cols)
+
+
+# ---------- SEARCH (FIXED: REMOVED "ids" from include list) ----------
 @app.route("/search", methods=["GET", "POST"])
 def search():
     """Handles vector similarity search and keyword/hybrid filtering."""
@@ -232,17 +243,18 @@ def search():
 
         query_emb = model.encode([query])[0].tolist()
 
+        # FIX: Removed "ids" from the include list, as they are returned by default.
         res = col.query(
             query_embeddings=[query_emb],
             n_results=topk,
-            include=["documents", "metadatas", "distances", "ids"],
+            include=["documents", "metadatas", "distances"], 
             where=where
         )
 
         docs = res["documents"][0]
         metas = res["metadatas"][0]
         dists = res["distances"][0]
-        ids = res["ids"][0]
+        ids = res["ids"][0] # IDs are still available here
 
         results = []
         for doc, meta, dist, doc_id in zip(docs, metas, dists, ids):
@@ -282,7 +294,7 @@ def delete_document(col_name, doc_id):
     return redirect(url_for("search"))
 
 
-# ---------- VISUALIZATION (UPDATED TO USE CHROMADB) ----------
+# ---------- VISUALIZATION ----------
 @app.route("/visualize", methods=["GET", "POST"])
 def visualize():
     """
@@ -298,7 +310,6 @@ def visualize():
         try:
             col = client.get_collection(selected_col)
             
-            # 1. Fetch all embeddings, IDs, and metadata from the selected Chroma collection
             data = col.get(
                 include=["documents", "metadatas", "embeddings"]
             )
@@ -310,15 +321,13 @@ def visualize():
             
         except Exception as e:
             error = f"Error retrieving data from collection '{selected_col}': {e}"
-            vectors = [] # Ensure vectors is empty on error
+            vectors = [] 
 
         
-        # 2. Check minimum data count for PCA
         if len(vectors) < 2:
             error = f"Need at least 2 documents in collection '{selected_col}' for PCA visualization (found {len(vectors)})."
             
         else:
-            # 3. PCA reduction
             vectors = np.array(vectors)
             pca = PCA(n_components=2)
             
@@ -327,7 +336,6 @@ def visualize():
                 x_vals = reduced[:, 0].tolist()
                 y_vals = reduced[:, 1].tolist()
 
-                # 4. Combine data for template
                 chart_data = []
                 for i in range(len(doc_ids)):
                     chart_data.append({
@@ -335,14 +343,12 @@ def visualize():
                         "x": x_vals[i],
                         "y": y_vals[i],
                         "meta": metadatas[i],
-                        # Truncate document for tooltip snippet
                         "snippet": documents[i][:80] + "..." if documents[i] else "No text"
                     })
             except ValueError as e:
                 error = f"PCA fitting failed. Check embedding dimensions. Error: {e}"
 
 
-    # Initial GET request or POST result display
     return render_template(
         "visualize.html",
         collections=cols,
